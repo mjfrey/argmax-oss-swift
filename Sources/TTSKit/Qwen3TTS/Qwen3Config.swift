@@ -125,7 +125,7 @@ public enum Qwen3VariantDefaults {
     public static let codeEmbedder = "W16A16"
     public static let multiCodeEmbedder = "W16A16"
     public static let textProjector = "W8A16"
-    public static let speechDecoder = "W8A16"
+    public static let speechDecoder = "W8A16-multifunction"
 }
 
 // MARK: - TTSKit Configuration
@@ -216,6 +216,10 @@ open class TTSKitConfig {
     /// `supportsVoiceCloning == true` (the Base model).
     public var voiceClones: [String: Qwen3VoicePack] = [:]
 
+    /// Which multifunction SpeechDecoder function to load. `.latencyOptimized`
+    /// (default) decodes one frame per call; `.throughputOptimized` decodes four.
+    public var speechDecoderMode: Qwen3SpeechDecoderMode
+
     // MARK: - Compute
 
     /// Compute unit configuration per model component.
@@ -300,6 +304,7 @@ open class TTSKitConfig {
         multiCodeEmbedderVariant: String? = nil,
         textProjectorVariant: String? = nil,
         speechDecoderVariant: String? = nil,
+        speechDecoderMode: Qwen3SpeechDecoderMode = .latencyOptimized,
         computeOptions: ComputeOptions = ComputeOptions(),
         verbose: Bool = true,
         logLevel: Logging.LogLevel = .info,
@@ -325,6 +330,7 @@ open class TTSKitConfig {
         self.multiCodeEmbedderVariant = multiCodeEmbedderVariant ?? model.multiCodeEmbedderVariant
         self.textProjectorVariant = textProjectorVariant ?? model.textProjectorVariant
         self.speechDecoderVariant = speechDecoderVariant ?? model.speechDecoderVariant
+        self.speechDecoderMode = speechDecoderMode
         self.computeOptions = computeOptions
         self.verbose = verbose
         self.logLevel = logLevel
