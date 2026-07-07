@@ -718,7 +718,8 @@ open class TTSKit: @unchecked Sendable {
                     tokenizer: tokenizer,
                     suppressTokenIds: Qwen3TTSConstants.suppressTokenIds,
                     loadTimings: currentTimings,
-                    progress: progress
+                    progress: progress,
+                    voiceClones: config.voiceClones
                 )
         }
     }
