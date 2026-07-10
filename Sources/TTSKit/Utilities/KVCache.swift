@@ -441,9 +441,12 @@ public extension SpeechDecoderCache {
         else {
             return
         }
-        let keyArr = await keyUpdateTensor.toMLMultiArray()
-        let valArr = await valueUpdateTensor.toMLMultiArray()
-        update(keyCacheUpdates: keyArr, valueCacheUpdates: valArr)
+        // Key and value outputs are independent. Materialize them concurrently
+        // to avoid serializing two blocking conversions on the cooperative pool.
+        async let keyArr = keyUpdateTensor.toMLMultiArray()
+        async let valArr = valueUpdateTensor.toMLMultiArray()
+        let (keyMaterialized, valueMaterialized) = await (keyArr, valArr)
+        update(keyCacheUpdates: keyMaterialized, valueCacheUpdates: valueMaterialized)
 
         guard let hiddenUpdateTensor = tensorOutputs["hidden_context_update"] else { return }
         let updateArr = await hiddenUpdateTensor.toMLMultiArray()
