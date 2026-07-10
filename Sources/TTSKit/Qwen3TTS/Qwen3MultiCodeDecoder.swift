@@ -105,13 +105,6 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
         guard let model else { return }
         let sequenceLength = kvCacheMaxSequenceLength
         let dummyInput = MLTensor(zeros: [1, inputEmbedDim, 1, 1], scalarType: FloatType.self)
-        // Each prewarm pass follows the same 16 positions. Rebuilding the full
-        // sequence-length masks for every pass only adds host allocations; the
-        // masks do not depend on the cache tensor contents.
-        var masksByPosition: [Int: MLTensorMasks] = [:]
-        for position in 0..<16 {
-            masksByPosition[position] = buildMasks(position: position, sequenceLength: sequenceLength)
-        }
         for _ in 0..<4 {
             var keyCache = MLTensor(zeros: [1, kvCacheEmbedDim, 1, sequenceLength], scalarType: FloatType.self)
             var valueCache = MLTensor(zeros: [1, kvCacheEmbedDim, 1, sequenceLength], scalarType: FloatType.self)
@@ -120,8 +113,7 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
                 let stepResult = try await predictMLTensorStep(
                     inputEmbeds: dummyInput, model: model,
                     keyCache: keyCache, valueCache: valueCache,
-                    cachePosition: cachePosition, sequenceLength: sequenceLength,
-                    masks: masksByPosition[Int(cachePosition)]
+                    cachePosition: cachePosition, sequenceLength: sequenceLength
                 )
                 keyCache = stepResult.keyCache
                 valueCache = stepResult.valueCache
@@ -215,10 +207,9 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
         keyCache: MLTensor,
         valueCache: MLTensor,
         cachePosition: Int32,
-        sequenceLength: Int,
-        masks: MLTensorMasks? = nil
+        sequenceLength: Int
     ) async throws -> MLTensorStepResult {
-        let masks = masks ?? buildMasks(position: Int(cachePosition), sequenceLength: sequenceLength)
+        let masks = buildMasks(position: Int(cachePosition), sequenceLength: sequenceLength)
         let predictionStart = CFAbsoluteTimeGetCurrent()
         let outputs = try await model.prediction(from: [
             "input_embeds": inputEmbeds,
