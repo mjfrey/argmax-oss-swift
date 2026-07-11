@@ -22,6 +22,11 @@ public class Qwen3CodeDecoder: CodeDecoding, @unchecked Sendable {
     public private(set) var kvCacheMaxSequenceLength: Int = Qwen3TTSConstants.cdMaxSeq
     /// Input embedding dimension
     public private(set) var embedSize: Int = Qwen3TTSConstants.embedDim
+    /// True when the Core ML program updates its own MLState KV buffers.
+    /// Older stateful Qwen assets expose update tensors and require the host to
+    /// scatter them into MLState; the FP16 self-writing asset deliberately does
+    /// not expose those outputs.
+    private var modelWritesKVState = false
 
     public init() {}
 
@@ -34,9 +39,14 @@ public class Qwen3CodeDecoder: CodeDecoding, @unchecked Sendable {
         guard !prewarmMode else { return }
 
         self.model = loaded
+        if #available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *) {
+            self.modelWritesKVState = !loaded.modelDescription.stateDescriptionsByName.isEmpty
+                && loaded.modelDescription.outputDescriptionsByName["key_cache_updates"] == nil
+        }
 
         // Detect dimensions from model description
-        // key_cache_updates output shape: [1, cacheDim, 1, 1]
+        // Legacy assets expose key_cache_updates as [1, cacheDim, 1, 1].
+        // The self-writing asset does not, so retain the format default there.
         if let dim = ModelUtilities.getModelOutputDimension(model, named: "key_cache_updates", position: 1) {
             self.kvCacheEmbedDim = dim
         }
@@ -102,13 +112,15 @@ public class Qwen3CodeDecoder: CodeDecoding, @unchecked Sendable {
             outputs = try await model.prediction(from: inputs)
         }
 
-        guard let keyTensor = outputs["key_cache_updates"],
-            let valueTensor = outputs["value_cache_updates"]
-        else {
+        let usesSelfWritingState = modelWritesKVState && state is MLState && isStateful
+        let keyTensor = outputs["key_cache_updates"]
+        let valueTensor = outputs["value_cache_updates"]
+        if !usesSelfWritingState && (keyTensor == nil || valueTensor == nil) {
             throw TTSError.generationFailed("CodeDecoder: missing key/value cache update tensors")
         }
 
-        if let mlState = state as? MLState, isStateful {
+        if let mlState = state as? MLState, isStateful,
+           let keyTensor, let valueTensor {
             await KVCache.updateStateCache(
                 state: mlState,
                 keyTensor: keyTensor,
@@ -119,11 +131,12 @@ public class Qwen3CodeDecoder: CodeDecoding, @unchecked Sendable {
 
         let cacheUpdateStart = CFAbsoluteTimeGetCurrent()
         if let _ = state as? MLState, isStateful {
-            // Stateful MLState already received the materialized outputs above;
-            // only advance the host-side position and masks here.
+            // The self-writing model already updated MLState during prediction;
+            // legacy models received a host-side scatter above. Both only need
+            // the host cache position/masks advanced here.
             cache.update()
         } else {
-            await cache.update(keyTensor: keyTensor, valueTensor: valueTensor)
+            await cache.update(keyTensor: keyTensor!, valueTensor: valueTensor!)
         }
         let cacheTime = CFAbsoluteTimeGetCurrent() - cacheUpdateStart
 
@@ -162,19 +175,26 @@ public class Qwen3CodeDecoder: CodeDecoding, @unchecked Sendable {
             output = try await model.asyncPrediction(from: input)
         }
 
-        guard let keyCacheUpdates = output.featureValue(for: "key_cache_updates")?.multiArrayValue,
-            let valueCacheUpdates = output.featureValue(for: "value_cache_updates")?.multiArrayValue
-        else {
+        let usesSelfWritingState = modelWritesKVState && state is MLState && isStateful
+        let keyCacheUpdates = output.featureValue(for: "key_cache_updates")?.multiArrayValue
+        let valueCacheUpdates = output.featureValue(for: "value_cache_updates")?.multiArrayValue
+        if !usesSelfWritingState && (keyCacheUpdates == nil || valueCacheUpdates == nil) {
             throw TTSError.generationFailed("CodeDecoder: missing key/value cache update arrays")
         }
 
-        if #available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *), let mlState = state as? MLState, isStateful {
+        if #available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *), let mlState = state as? MLState, isStateful,
+           let keyCacheUpdates, let valueCacheUpdates {
             KVCache.updateStateCache(
                 state: mlState,
                 keyCacheUpdates: keyCacheUpdates,
                 valueCacheUpdates: valueCacheUpdates,
                 position: Int(cache.cacheLength)
             )
+        }
+
+        if #available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *),
+           let _ = state as? MLState, isStateful {
+            cache.update()
         }
 
         guard let logitsArray = output.featureValue(for: "logits")?.multiArrayValue,
