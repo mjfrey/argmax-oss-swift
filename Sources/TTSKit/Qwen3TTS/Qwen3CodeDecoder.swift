@@ -130,10 +130,13 @@ public class Qwen3CodeDecoder: CodeDecoding, @unchecked Sendable {
         }
 
         let cacheUpdateStart = CFAbsoluteTimeGetCurrent()
-        if let _ = state as? MLState, isStateful {
+        if state is MLState, isStateful, cache.isStateful {
             // The self-writing model already updated MLState during prediction;
             // legacy models received a host-side scatter above. Both only need
-            // the host cache position/masks advanced here.
+            // the host cache position/masks advanced here. Guarding on
+            // cache.isStateful keeps a mismatched external-cache KVCache on the
+            // materializing path below instead of silently skipping its
+            // key/value writes.
             cache.update()
         } else {
             await cache.update(keyTensor: keyTensor!, valueTensor: valueTensor!)
