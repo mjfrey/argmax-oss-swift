@@ -226,6 +226,10 @@ public struct GenerationOptions: Codable, Sendable {
 
     public var temperature: Float
     public var topK: Int
+    /// Optional sampling overrides for residual codec heads 1...15.
+    /// When nil, the main talker temperature/topK are reused.
+    public var multiCodeTemperature: Float?
+    public var multiCodeTopK: Int?
     public var repetitionPenalty: Float
     public var maxNewTokens: Int
 
@@ -261,6 +265,8 @@ public struct GenerationOptions: Codable, Sendable {
     public init(
         temperature: Float = GenerationOptions.defaultTemperature,
         topK: Int = GenerationOptions.defaultTopK,
+        multiCodeTemperature: Float? = nil,
+        multiCodeTopK: Int? = nil,
         repetitionPenalty: Float = GenerationOptions.defaultRepetitionPenalty,
         maxNewTokens: Int = GenerationOptions.defaultMaxNewTokens,
         concurrentWorkerCount: Int = 0,
@@ -272,6 +278,8 @@ public struct GenerationOptions: Codable, Sendable {
     ) {
         self.temperature = temperature
         self.topK = topK
+        self.multiCodeTemperature = multiCodeTemperature
+        self.multiCodeTopK = multiCodeTopK
         self.repetitionPenalty = repetitionPenalty
         self.maxNewTokens = maxNewTokens
         self.concurrentWorkerCount = concurrentWorkerCount

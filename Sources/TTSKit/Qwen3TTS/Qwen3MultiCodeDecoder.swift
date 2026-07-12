@@ -260,6 +260,8 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
         var valueCache = MLTensor(zeros: [1, kvCacheEmbedDim, 1, sequenceLength], scalarType: FloatType.self)
         var cachePosition: Int32 = 0
         var timings = SpeechTimings()
+        let samplingTemperature = options.multiCodeTemperature ?? options.temperature
+        let samplingTopK = options.multiCodeTopK ?? options.topK
 
         // Prefill: hidden_states, then code_0_embed. First call's logits are discarded.
         var stepResult = try await predictMLTensorStep(
@@ -294,8 +296,8 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
         let code1 = await sampler.sampleMultiHead(
             allLogits: firstStepLogits,
             headIndex: stepIndex,
-            temperature: options.temperature,
-            topK: options.topK
+            temperature: samplingTemperature,
+            topK: samplingTopK
         )
         timings.multiCodeDecoderSampling += CFAbsoluteTimeGetCurrent() - samplingStart
         var codes: [Int32] = [code1]
@@ -334,8 +336,8 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
             let code = await sampler.sampleMultiHead(
                 allLogits: nextStepLogits,
                 headIndex: stepIndex,
-                temperature: options.temperature,
-                topK: options.topK
+                temperature: samplingTemperature,
+                topK: samplingTopK
             )
             timings.multiCodeDecoderSampling += CFAbsoluteTimeGetCurrent() - nextSamplingStart
             codes.append(code)
@@ -354,6 +356,8 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
         options: GenerationOptions
     ) async throws -> MultiCodeGenerationResult {
         var timings = SpeechTimings()
+        let samplingTemperature = options.multiCodeTemperature ?? options.temperature
+        let samplingTopK = options.multiCodeTopK ?? options.topK
         let mcdCache = try KVCache(
             cacheDim: kvCacheEmbedDim,
             maxSeqLength: kvCacheMaxSequenceLength,
@@ -390,8 +394,8 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
         let code1 = await sampler.sampleMultiHead(
             allLogits: mcdOutput.allLogits,
             headIndex: stepIndex,
-            temperature: options.temperature,
-            topK: options.topK
+            temperature: samplingTemperature,
+            topK: samplingTopK
         )
         timings.multiCodeDecoderSampling += CFAbsoluteTimeGetCurrent() - samplingStart
         var codes: [Int32] = [code1]
@@ -429,8 +433,8 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
             let code = await sampler.sampleMultiHead(
                 allLogits: mcdOutput.allLogits,
                 headIndex: stepIndex,
-                temperature: options.temperature,
-                topK: options.topK
+                temperature: samplingTemperature,
+                topK: samplingTopK
             )
             timings.multiCodeDecoderSampling += CFAbsoluteTimeGetCurrent() - nextSamplingStart
             codes.append(code)
