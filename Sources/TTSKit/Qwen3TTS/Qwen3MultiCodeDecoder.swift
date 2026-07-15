@@ -91,8 +91,15 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
     /// the sampled codes' MultiCodeEmbedder rows - the caller adds
     /// CodeEmbedder(code0) and the text embed to form the next talker input.
     ///
+    /// Greedy residual sampling (`multiCodeTopK == 1` or `multiCodeTemperature
+    /// == 0`) is expressed by zeroing the noise: `argmax(logits/T + 0)` is a
+    /// deterministic top-1, matching the stepped path's greedy heads. Without
+    /// this, the always-present Gumbel noise makes near-tied heads occasionally
+    /// pick a lower-probability code - an audible click on a random frame.
+    ///
     /// Note: noise comes from the system RNG, so `GenerationOptions.seed` does
-    /// not reproduce fused-path audio (the stepped path keeps that property).
+    /// not reproduce stochastic fused-path audio (the stepped path keeps that
+    /// property; greedy is deterministic either way).
     @available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *)
     public func generateMultiCodesFused(
         hiddenStatesTensor: MLTensor,
@@ -102,10 +109,14 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
         guard let model else { throw TTSError.generationFailed("MultiCodeDecoder model not loaded") }
         // The graph divides logits by temperature; keep it strictly positive.
         let temperature = max(options.multiCodeTemperature ?? options.temperature, 0.05)
+        let greedy = (options.multiCodeTopK ?? options.topK) <= 1
+            || (options.multiCodeTemperature ?? options.temperature) <= 0
         var noise = [FloatType](repeating: 0, count: Qwen3TTSConstants.mcdHeads * codecVocabSize)
-        for index in noise.indices {
-            let uniform = Float.random(in: Float.leastNormalMagnitude..<1)
-            noise[index] = FloatType(-log(-log(uniform)))
+        if !greedy {
+            for index in noise.indices {
+                let uniform = Float.random(in: Float.leastNormalMagnitude..<1)
+                noise[index] = FloatType(-log(-log(uniform)))
+            }
         }
         let inputs: [String: MLTensor] = [
             "talker_hidden": hiddenStatesTensor,
