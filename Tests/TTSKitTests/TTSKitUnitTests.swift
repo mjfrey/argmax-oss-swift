@@ -644,6 +644,70 @@ final class TTSKitUnitTests: XCTestCase {
         XCTAssertFalse(decoder.isFused)
     }
 
+    // MARK: - Fused sampling option resolution
+
+    private func fusedSampling(
+        temperature: Float = GenerationOptions.defaultTemperature,
+        topK: Int = GenerationOptions.defaultTopK,
+        multiCodeTemperature: Float? = nil,
+        multiCodeTopK: Int? = nil,
+        codecVocabSize: Int = 1024
+    ) -> Qwen3MultiCodeDecoder.FusedSampling {
+        let options = GenerationOptions(
+            temperature: temperature,
+            topK: topK,
+            multiCodeTemperature: multiCodeTemperature,
+            multiCodeTopK: multiCodeTopK
+        )
+        return Qwen3MultiCodeDecoder.resolveFusedSampling(options: options, codecVocabSize: codecVocabSize)
+    }
+
+    /// The per-stage overrides must reach the fused graph, otherwise flipping
+    /// `.stepped` -> `.fused` silently resamples the residual heads at the
+    /// talker's temperature (0.9 by default) instead of the requested value.
+    func testFusedSamplingHonorsMultiCodeOverrides() {
+        let sampling = fusedSampling(temperature: 0.9, topK: 50, multiCodeTemperature: 0.3, multiCodeTopK: 8)
+        XCTAssertEqual(sampling.temperature, 0.3, accuracy: 1e-6)
+        XCTAssertEqual(sampling.topK, 8)
+        XCTAssertFalse(sampling.isGreedy)
+    }
+
+    func testFusedSamplingFallsBackToTalkerOptions() {
+        let sampling = fusedSampling(temperature: 0.7, topK: 20)
+        XCTAssertEqual(sampling.temperature, 0.7, accuracy: 1e-6)
+        XCTAssertEqual(sampling.topK, 20)
+        XCTAssertFalse(sampling.isGreedy)
+    }
+
+    /// `multiCodeTemperature: 0` means greedy residuals even when the talker samples.
+    func testFusedSamplingGreedyViaMultiCodeTemperature() {
+        let sampling = fusedSampling(temperature: 0.9, topK: 50, multiCodeTemperature: 0)
+        XCTAssertTrue(sampling.isGreedy)
+        XCTAssertEqual(sampling.temperature, 1, accuracy: 1e-6, "Greedy divides logits by 1")
+    }
+
+    /// `topK == 1` is deterministic on the stepped path; the fused path only matches
+    /// if the noise is zeroed, since assets with k baked in ignore the `top_k` input.
+    func testFusedSamplingGreedyViaMultiCodeTopK() {
+        let sampling = fusedSampling(temperature: 0.9, topK: 50, multiCodeTopK: 1)
+        XCTAssertTrue(sampling.isGreedy)
+        XCTAssertEqual(sampling.temperature, 1, accuracy: 1e-6)
+        XCTAssertEqual(sampling.topK, 1)
+    }
+
+    func testFusedSamplingClampsTemperatureToFP16SafeFloor() {
+        let sampling = fusedSampling(temperature: 0.001)
+        XCTAssertEqual(sampling.temperature, 0.05, accuracy: 1e-6)
+        XCTAssertFalse(sampling.isGreedy)
+    }
+
+    /// `topK <= 0` means "no top-k" — saturate at the vocab rather than passing 0.
+    func testFusedSamplingUnboundedTopKSaturatesAtVocab() {
+        let sampling = fusedSampling(topK: 0, codecVocabSize: 2048)
+        XCTAssertEqual(sampling.topK, 2048)
+        XCTAssertFalse(sampling.isGreedy)
+    }
+
     func testTTSKitConfigMultiCodeDecoderModeDefault() {
         let config = TTSKitConfig()
         XCTAssertEqual(config.multiCodeDecoderMode, .stepped)

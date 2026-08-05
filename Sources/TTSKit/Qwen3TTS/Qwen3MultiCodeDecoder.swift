@@ -105,10 +105,50 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
     /// True when the loaded model is the fused one-call-per-frame variant.
     public private(set) var isFused = false
 
+    /// Sampling inputs for the fused graph, resolved from `GenerationOptions`.
+    struct FusedSampling: Equatable {
+        /// Divisor applied to the logits in-graph. Always strictly positive.
+        let temperature: Float
+        /// Candidate count for the in-graph top-k, when the asset takes `top_k`.
+        let topK: Int
+        /// True when the noise must be zeroed to make the frame a deterministic top-1.
+        let isGreedy: Bool
+    }
+
+    /// Maps `GenerationOptions` onto the fused graph's sampling inputs.
+    ///
+    /// Residual heads 1...15 honor the same `multiCodeTemperature`/`multiCodeTopK`
+    /// overrides as the stepped path, so a given `GenerationOptions` samples the
+    /// residuals identically in either mode.
+    static func resolveFusedSampling(options: GenerationOptions, codecVocabSize: Int) -> FusedSampling {
+        let requestedTemperature = options.multiCodeTemperature ?? options.temperature
+        let requestedTopK = options.multiCodeTopK ?? options.topK
+        // `topK <= 0` means "no top-k"; the graph saturates at its compiled candidate count.
+        let topK = requestedTopK > 0 ? requestedTopK : codecVocabSize
+        // `topK == 1` is a deterministic top-1 on the stepped path. In-graph it is only
+        // deterministic when the asset takes `top_k`; with k baked in at conversion the
+        // request is ignored, and the noise would perturb near-tied heads. Reporting it
+        // as greedy zeroes the noise, making greedy exact either way.
+        let isGreedy = requestedTemperature <= 0 || topK <= 1
+        return FusedSampling(
+            // Exact greedy: argmax(logits / 1 + 0) == argmax(logits).
+            // Otherwise the graph divides fp16 logits by an fp16 temperature, so the floor
+            // is an fp16 range guard: small values overflow and anything under 0.05 is a
+            // safe value that is practically greedy.
+            temperature: isGreedy ? 1 : max(requestedTemperature, 0.05),
+            topK: topK,
+            isGreedy: isGreedy
+        )
+    }
+
     /// One CoreML call for the whole 15-code frame. Sampling runs in-graph via
     /// the Gumbel-max trick (`argmax(logits/T + G)` draws from `softmax(logits/T)`)
     /// with noise from `sampler`'s RNG, so seeded generation reproduces.
     /// `embed_sum` is the sum of the sampled codes' MultiCodeEmbedder rows.
+    ///
+    /// Sampling reads `multiCodeTemperature`/`multiCodeTopK` (falling back to the
+    /// talker's `temperature`/`topK`) so that a given `GenerationOptions` samples
+    /// the residual heads the same way in `.stepped` and `.fused`.
     @available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *)
     public func generateMultiCodesFused(
         hiddenStatesTensor: MLTensor,
@@ -118,30 +158,19 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
     ) async throws -> (codes: [Int32], embedSum: MLTensor, predictionTime: TimeInterval) {
         guard let model else { throw TTSError.generationFailed("MultiCodeDecoder model not loaded") }
         let noiseCount = Qwen3TTSConstants.mcdHeads * codecVocabSize
-        let temperature: Float
-        let noise: [FloatType]
-        if options.temperature <= 0 {
-            // Exact greedy: argmax(logits / 1 + 0) == argmax(logits)
-            temperature = 1
-            noise = [FloatType](repeating: 0, count: noiseCount)
-        } else {
-            // The graph divides fp16 logits by an fp16 temperature, so the floor is an fp16
-            // range guard: small values overflow and anything under
-            // 0.05 is a safe value that is practically greedy.
-            temperature = max(options.temperature, 0.05)
-            // Bare `FloatType.init` is ambiguous on x86_64 where `FloatType == Float`.
-            noise = sampler.gumbelNoise(count: noiseCount).map { FloatType($0) }
-        }
+        let sampling = Self.resolveFusedSampling(options: options, codecVocabSize: codecVocabSize)
+        // Bare `FloatType.init` is ambiguous on x86_64 where `FloatType == Float`.
+        let noise: [FloatType] = sampling.isGreedy
+            ? [FloatType](repeating: 0, count: noiseCount)
+            : sampler.gumbelNoise(count: noiseCount).map { FloatType($0) }
         var inputs: [String: MLTensor] = [
             "code0_hidden_states": hiddenStatesTensor,
             "code0_embed": code0EmbedTensor,
             "gumbel": MLTensor(shape: [Qwen3TTSConstants.mcdHeads, codecVocabSize], scalars: noise),
-            "temperature": MLTensor(shape: [1], scalars: [FloatType(temperature)]),
+            "temperature": MLTensor(shape: [1], scalars: [FloatType(sampling.temperature)]),
         ]
         if model.modelDescription.inputDescriptionsByName["top_k"] != nil {
-            // topK <= 0 means "no top-k"; the graph saturates at its compiled candidate count.
-            let topK = options.topK > 0 ? options.topK : codecVocabSize
-            inputs["top_k"] = MLTensor(shape: [1], scalars: [Int32(topK)])
+            inputs["top_k"] = MLTensor(shape: [1], scalars: [Int32(sampling.topK)])
         }
         let predictionStart = CFAbsoluteTimeGetCurrent()
         let outputs = try await model.prediction(from: inputs)
