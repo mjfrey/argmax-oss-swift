@@ -419,6 +419,7 @@ open class Qwen3GenerateTask: @unchecked Sendable, SpeechGenerating {
                     let fused = try await multiCodeDecoder.generateMultiCodesFused(
                         hiddenStatesTensor: hiddenStatesTensor,
                         code0EmbedTensor: code0EmbedTensor,
+                        sampler: sampler,
                         options: options
                     )
                     timings.multiCodeDecoder += CFAbsoluteTimeGetCurrent() - mcdStart
@@ -528,6 +529,12 @@ open class Qwen3GenerateTask: @unchecked Sendable, SpeechGenerating {
                 let mcdStart = CFAbsoluteTimeGetCurrent()
                 guard let hiddenStates = lastCdOutput.hiddenStates as? [FloatType] else {
                     throw TTSError.generationFailed("Expected [FloatType] hidden states on legacy path")
+                }
+                guard !multiCodeDecoder.isFused else {
+                    throw TTSError.generationFailed(
+                        "Fused MultiCodeDecoder assets require macOS 15 / iOS 18; " +
+                        "use a stepped variant on this OS"
+                    )
                 }
                 let mcdResult = try await multiCodeDecoder.generateMultiCodes(
                     hiddenStates: hiddenStates, code0Embed: code0Embed,

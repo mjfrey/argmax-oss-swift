@@ -10,15 +10,9 @@ import ArgmaxCore
 public extension ModelInfo {
     static func segmenter(version: String? = nil, variant: String? = nil, computeUnits: MLComputeUnits = .cpuOnly) -> ModelInfo {
         let variant = variant ?? {
-            #if targetEnvironment(simulator)
             if #available(iOS 18, macOS 15, *) {
                 return "W8A16"
             }
-            #else
-            if #available(iOS 17, macOS 14, *) {
-                return "W8A16"
-            }
-            #endif
 
             return "W32A32"
         }()
@@ -119,12 +113,26 @@ public class PyannoteConfig: SpeakerKitConfig, @unchecked Sendable {
 
 // MARK: - Diarization Options
 
+public enum SpeakerCentroidSource: Equatable, Hashable, Sendable {
+    /// Mean of all embeddings under the final post-reassignment speaker labels, without
+    /// any filtering for quality of embeddings.
+    case finalAssignment
+
+    /// Mean of embeddings under the final post-reassignment speaker labels, with
+    /// additional filtering by the clustering algorithm for purer voice embeddings.
+    /// May omit speakers whose members are entirely excluded by the filter. Use
+    /// `if let centroid = speakerCentroidEmbeddings[id]` rather than assuming the
+    /// key is present.
+    case trainableOnly
+}
+
 public struct PyannoteDiarizationOptions: DiarizationOptions {
     public var numberOfSpeakers: Int?
     public var minActiveOffset: Float?
     public var clusterDistanceThreshold: Float?
     public var minClusterSize: Int?
     public var useExclusiveReconciliation: Bool
+    public var centroidSource: SpeakerCentroidSource
     /// Optional seek boundaries in seconds; pairs define [start, end] clips. Empty means process full audio.
     public var clipTimestamps: [Float]
 
@@ -134,6 +142,7 @@ public struct PyannoteDiarizationOptions: DiarizationOptions {
         clusterDistanceThreshold: Float? = nil,
         minClusterSize: Int? = nil,
         useExclusiveReconciliation: Bool = true,
+        centroidSource: SpeakerCentroidSource = .finalAssignment,
         clipTimestamps: [Float] = []
     ) {
         self.numberOfSpeakers = numberOfSpeakers
@@ -141,6 +150,7 @@ public struct PyannoteDiarizationOptions: DiarizationOptions {
         self.clusterDistanceThreshold = clusterDistanceThreshold
         self.minClusterSize = minClusterSize
         self.useExclusiveReconciliation = useExclusiveReconciliation
+        self.centroidSource = centroidSource
         self.clipTimestamps = clipTimestamps
     }
 }
@@ -208,4 +218,3 @@ public struct PyannoteDiarizationTimings: DiarizationTimings, CustomStringConver
         """
     }
 }
-

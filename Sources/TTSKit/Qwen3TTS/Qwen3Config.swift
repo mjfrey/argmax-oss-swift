@@ -121,7 +121,7 @@ public enum TTSModelVariant: String, CustomStringConvertible, CaseIterable, Send
 /// Default quantization variant strings matching the standard model repository layout.
 public enum Qwen3VariantDefaults {
     public static let codeDecoder = "W8A16-stateful"
-    public static let multiCodeDecoder = "W8A16"
+    public static let multiCodeDecoder = "W8A16-multifunction"
     public static let codeEmbedder = "W16A16"
     public static let multiCodeEmbedder = "W16A16"
     public static let textProjector = "W8A16"
@@ -220,6 +220,10 @@ open class TTSKitConfig {
     /// (default) decodes one frame per call; `.throughputOptimized` decodes four.
     public var speechDecoderMode: Qwen3SpeechDecoderMode
 
+    /// Which multifunction MultiCodeDecoder function to load. `.stepped` (default)
+    /// decodes one position per call; `.fused` decodes the whole frame in one call.
+    public var multiCodeDecoderMode: Qwen3MultiCodeDecoderMode
+
     // MARK: - Compute
 
     /// Compute unit configuration per model component.
@@ -305,6 +309,7 @@ open class TTSKitConfig {
         textProjectorVariant: String? = nil,
         speechDecoderVariant: String? = nil,
         speechDecoderMode: Qwen3SpeechDecoderMode = .latencyOptimized,
+        multiCodeDecoderMode: Qwen3MultiCodeDecoderMode = .stepped,
         computeOptions: ComputeOptions = ComputeOptions(),
         verbose: Bool = true,
         logLevel: Logging.LogLevel = .info,
@@ -331,6 +336,7 @@ open class TTSKitConfig {
         self.textProjectorVariant = textProjectorVariant ?? model.textProjectorVariant
         self.speechDecoderVariant = speechDecoderVariant ?? model.speechDecoderVariant
         self.speechDecoderMode = speechDecoderMode
+        self.multiCodeDecoderMode = multiCodeDecoderMode
         self.computeOptions = computeOptions
         self.verbose = verbose
         self.logLevel = logLevel

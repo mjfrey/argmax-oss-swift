@@ -86,9 +86,61 @@ final class TTSKitUnitTests: XCTestCase {
         TextChunker(
             targetChunkSize: targetChunkSize,
             minChunkSize: minChunkSize,
-            encode: { $0.unicodeScalars.map { Int($0.value) } },
+            encode: scalarEncode,
             decode: { String($0.compactMap { Unicode.Scalar($0) }.map { Character($0) }) }
         )
+    }
+
+    /// Asserts whitespace-normalized chunks reassemble to the input text.
+    private func assertReconstructs(
+        _ chunks: [String],
+        _ text: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let joined = chunks.joined(separator: " ")
+            .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let original = text
+            .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        XCTAssertEqual(joined, original, "Chunks must reconstruct the input (whitespace-normalized)", file: file, line: line)
+    }
+
+    /// Encodes 1 unicode scalar per token, matching `makeChunker`.
+    private let scalarEncode: (String) -> [Int] = { $0.unicodeScalars.map { Int($0.value) } }
+
+    func testBoundaryAcceptsCJKTerminatorAtWindowEdge() {
+        // The window edge coincides with the ideographic full stop, so the final
+        // segment is a complete sentence and the boundary is the window end.
+        let window = "第一句话。第二句话。"
+        XCTAssertEqual(window.lastNaturalBoundary(minTokenCount: 1, encode: scalarEncode), window)
+    }
+
+    func testBoundaryAcceptsParagraphBreakAtWindowEdge() {
+        // A paragraph break at the window edge is a valid boundary even though
+        // the line has no terminator character.
+        let window = "A heading with no period\n"
+        XCTAssertEqual(window.lastNaturalBoundary(minTokenCount: 1, encode: scalarEncode), window)
+    }
+
+    func testBoundaryAcceptsBracketClosersAfterTerminator() {
+        // Closing brackets and guillemets after the terminator do not disqualify
+        // the final segment.
+        let window = "He said «All done.»"
+        XCTAssertEqual(window.lastNaturalBoundary(minTokenCount: 1, encode: scalarEncode), window)
+    }
+
+    func testBoundaryDoesNotSplitAfterAbbreviation() {
+        // Locale-aware segmentation (.localized) knows "Mr." does not end a
+        // sentence, so the sentence tier offers no boundary here and the
+        // word-space fallback splits before the last word instead.
+        let window = "He met Mr. Smith yesterday and then"
+        XCTAssertEqual(window.lastNaturalBoundary(minTokenCount: 1, encode: scalarEncode), "He met Mr. Smith yesterday and")
+    }
+
+    func testBoundaryStillRejectsMidSentenceWindowEdge() {
+        // A window truncated mid-sentence must fall back to an earlier boundary.
+        let window = "First sentence. Second incomplete and more"
+        XCTAssertEqual(window.lastNaturalBoundary(minTokenCount: 1, encode: scalarEncode), "First sentence. ")
     }
 
     func testChunkerShortText() {
@@ -109,9 +161,7 @@ final class TTSKitUnitTests: XCTestCase {
         let text = "This is the first sentence. This is the second sentence. And here is a third one."
         let chunks = chunker.chunk(text)
         XCTAssertGreaterThan(chunks.count, 1, "Should split into multiple chunks")
-        let recombined = chunks.joined(separator: " ")
-        XCTAssertTrue(recombined.contains("first sentence"))
-        XCTAssertTrue(recombined.contains("third one"))
+        assertReconstructs(chunks, text)
     }
 
     func testChunkerMergesTinyTrailing() {
@@ -122,6 +172,66 @@ final class TTSKitUnitTests: XCTestCase {
         let text = "A reasonably long sentence that is here. X."
         let chunks = chunker.chunk(text)
         XCTAssertEqual(chunks.count, 1, "Tiny trailing chunk should merge with previous")
+        assertReconstructs(chunks, text)
+    }
+
+    func testChunkerReconstructsAcrossParagraphBreaks() {
+        // Paragraph whitespace must not leak boundary characters into the next chunk:
+        //
+        //   bad:  ["First sentence.", ". Second sentence."]
+        //   good: ["First sentence.", "Second sentence."]
+        //
+        let text = "First sentence.\n\nSecond sentence."
+        let chunker = makeChunker(targetChunkSize: 20, minChunkSize: 5)
+        let chunks = chunker.chunk(text)
+        XCTAssertEqual(chunks, ["First sentence.", "Second sentence."])
+        assertReconstructs(chunks, text)
+    }
+
+    func testChunkerDoesNotSplitDecimalsEmailsEllipses() {
+        // Periods inside decimals, emails, and ellipses are not sentence boundaries:
+        //
+        //   bad:  ["It costs $8.", "50 today. Email info@test.", "org ..."]
+        //   good: ["It costs $8.50 today.", "Email info@test.org for offers."]
+        //
+        let text = "It costs $8.50 today. Email info@test.org for offers. Probably... the end."
+        let chunker = makeChunker(targetChunkSize: 45, minChunkSize: 5)
+        let chunks = chunker.chunk(text)
+        assertReconstructs(chunks, text)
+        XCTAssertTrue(chunks.contains { $0.contains("$8.50") }, "Decimal split across chunks: \(chunks)")
+        XCTAssertTrue(chunks.contains { $0.contains("info@test.org") }, "Email split across chunks: \(chunks)")
+        XCTAssertTrue(chunks.contains { $0.contains("Probably...") }, "Ellipsis split across chunks: \(chunks)")
+        for chunk in chunks {
+            XCTAssertFalse(chunk.hasPrefix("50 "), "Decimal fraction stranded: \(chunk)")
+            XCTAssertFalse(chunk.hasPrefix("org "), "Email TLD stranded: \(chunk)")
+        }
+    }
+
+    func testChunkerQuoteAttachedSentenceEnd() {
+        // A closing quote after a sentence ender stays on the sentence's chunk:
+        //
+        //   bad:  ["He said \"Hello.", "\" Then left."]
+        //   good: ["He said \"Hello.\"", "Then left."]
+        //
+        let text = "He said \"Hello.\" Then left."
+        let chunker = makeChunker(targetChunkSize: 20, minChunkSize: 5)
+        let chunks = chunker.chunk(text)
+        XCTAssertEqual(chunks, ["He said \"Hello.\"", "Then left."])
+        assertReconstructs(chunks, text)
+    }
+
+    func testChunkerSkipsTruncatedSentenceEndingInWhitespace() {
+        // "First sentence. Second incomplete " = 34 chars, so a 34-char window ends on a
+        // trailing space mid-sentence. That fragment must not count as a full sentence:
+        //
+        //   bad:  ["First sentence. Second incomplete and more"]
+        //   good: ["First sentence.", "Second incomplete and more words here."]
+        //
+        let text = "First sentence. Second incomplete and more words here."
+        let chunker = makeChunker(targetChunkSize: 34, minChunkSize: 5)
+        let chunks = chunker.chunk(text)
+        XCTAssertEqual(chunks.first, "First sentence.")
+        assertReconstructs(chunks, text)
     }
 
     // MARK: - Embedding Math
@@ -519,6 +629,45 @@ final class TTSKitUnitTests: XCTestCase {
         let config = TTSKitConfig()
         XCTAssertEqual(config.speechDecoderMode, .latencyOptimized)
         XCTAssertEqual(config.speechDecoderVariant, "W8A16-multifunction")
+    }
+
+    // MARK: - MultiCodeDecoder mode enum
+
+    func testMultiCodeDecoderModeFunctionNames() {
+        XCTAssertEqual(Qwen3MultiCodeDecoderMode.stepped.functionName, "stepped")
+        XCTAssertEqual(Qwen3MultiCodeDecoderMode.fused.functionName, "fused")
+    }
+
+    func testMultiCodeDecoderModeDefaults() {
+        let decoder = Qwen3MultiCodeDecoder()
+        XCTAssertEqual(decoder.mode, .stepped)
+        XCTAssertFalse(decoder.isFused)
+    }
+
+    func testTTSKitConfigMultiCodeDecoderModeDefault() {
+        let config = TTSKitConfig()
+        XCTAssertEqual(config.multiCodeDecoderMode, .stepped)
+        XCTAssertEqual(config.multiCodeDecoderVariant, "W8A16-multifunction")
+    }
+
+    // MARK: - Gumbel noise (fused MultiCodeDecoder sampling input)
+
+    func testGumbelNoiseSeededDeterminism() {
+        let noise1 = GreedyTokenSampler(seed: 42).gumbelNoise(count: 256)
+        let noise2 = GreedyTokenSampler(seed: 42).gumbelNoise(count: 256)
+        let noise3 = GreedyTokenSampler(seed: 43).gumbelNoise(count: 256)
+
+        XCTAssertEqual(noise1, noise2, "Same seed should produce identical Gumbel noise")
+        XCTAssertNotEqual(noise1, noise3, "Different seeds should produce different Gumbel noise")
+        XCTAssertEqual(noise1.count, 256)
+        XCTAssertTrue(noise1.allSatisfy(\.isFinite), "Gumbel noise must be finite")
+    }
+
+    func testGumbelNoiseConsumesSamplerRNG() {
+        let sampler = GreedyTokenSampler(seed: 7)
+        let first = sampler.gumbelNoise(count: 64)
+        let second = sampler.gumbelNoise(count: 64)
+        XCTAssertNotEqual(first, second, "Consecutive draws should consume the RNG stream")
     }
 
     // MARK: - Sampler
@@ -1047,11 +1196,7 @@ final class TTSKitUnitTests: XCTestCase {
         let sentences = (1...10).map { "Sentence number \($0) is here." }
         let text = sentences.joined(separator: " ")
         let chunks = chunker.chunk(text)
-        let rejoined = chunks.joined(separator: " ")
-        for sentence in sentences {
-            XCTAssertTrue(rejoined.contains(sentence.dropLast(1)), // drop period; joins may vary
-                "Missing content: \(sentence)")
-        }
+        assertReconstructs(chunks, text)
     }
 
     func testChunkerWordBoundaryFallback() {

@@ -23,7 +23,7 @@
 
 [Argmax](https://argmaxinc.com/blog) Open-Source SDK Swift is a collection of turn-key on-device inference frameworks:
 - **WhisperKit** for speech-to-text with OpenAI Whisper
-- **SpeakerKit** for speaker diarization Pyannote
+- **SpeakerKit** for speaker diarization with Pyannote
 - **TTSKit** for text-to-speech with Qwen-TTS
 
 > [!IMPORTANT]
@@ -46,8 +46,9 @@
   - [Xcode Steps](#xcode-steps)
   - [Package.swift](#packageswift)
   - [Homebrew](#homebrew)
-- [Getting Started](#getting-started)
+- [WhisperKit](#whisperkit)
   - [Quick Example](#quick-example)
+  - [Memory-Efficient Loading for Large Files](#memory-efficient-loading-for-large-files)
   - [Model Selection](#model-selection)
   - [Generating Models](#generating-models)
   - [Swift CLI](#swift-cli)
@@ -136,7 +137,7 @@ You can install the command line app using [Homebrew](https://brew.sh) by runnin
 brew install whisperkit-cli
 ```  
 
-## Getting Started
+## WhisperKit
 
 To get started with WhisperKit, you need to initialize it in your project.
 
@@ -149,16 +150,54 @@ import WhisperKit
 
 // Initialize WhisperKit with default settings
 Task {
-   let pipe = try? await WhisperKit()
-   let transcription = try? await pipe!.transcribe(audioPath: "path/to/your/audio.{wav,mp3,m4a,flac}")?.text
-    print(transcription)
+    let pipe = try? await WhisperKit()
+    let results = try? await pipe?.transcribe(audioPath: "path/to/your/audio.{wav,mp3,m4a,flac}")
+    let transcription = results?.map(\.text).joined(separator: " ")
+    print(transcription ?? "")
 }
+```
+
+### Memory-Efficient Loading for Large Files
+
+By default WhisperKit loads the whole audio file into memory before transcribing. For long recordings, `.incremental` streams it from disk in bounded-memory chunks instead:
+
+```swift
+import WhisperKit
+
+let pipe = try await WhisperKit()
+
+let options = AudioInputOptions(audioLoadingMode: .incremental)
+let results = try await pipe.transcribe(
+    audioPath: "path/to/large-audio.wav",
+    audioInputOptions: options
+)
+print(results.map(\.text).joined(separator: " "))
+```
+
+It splits the audio at silence (VAD) boundaries, so the result matches a full-file transcription run with `chunkingStrategy: .vad` — only peak memory differs. Tune the chunking with `.incremental(chunkDuration:chunkBufferSize:)`, or pick channels with `AudioInputOptions(channelMode:)`.
+
+From the CLI, add `--incremental-loading` (optionally `--incremental-chunk-duration` / `--incremental-chunk-buffer-size`):
+
+```bash
+swift run argmax-cli transcribe --model large-v3-v20240930_626MB --audio-path "path/to/large-audio.wav" --incremental-loading
 ```
 
 ### Model Selection
 
 > [!NOTE]
 > Argmax recommends `large-v3-v20240930_626MB` for maximum multilingual accuracy and `tiny` for the fastest debugging workflow.
+
+| Whisper Version                  | WhisperKit Variant                                                                                                 | Description                                                                      |
+|----------------------------------|------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------|
+| Large v3 Turbo (compressed)      | [large-v3-v20240930_626MB](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-large-v3-v20240930_626MB) | Recommended across iOS and macOS for maximum accuracy                            |
+| Large v3 Turbo                   | [large-v3-v20240930_turbo](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-large-v3-v20240930_turbo) | Recommended on macOS for maximum speed and accuracy                             |
+| Base (multilingual)              | [base](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-base)                         |                                                                                  |
+| Base (English-only)              | [base.en](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-base.en)                   |                                                                                  |
+| Small (Multilingual)             | [small](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-small)                       |                                                                                  |
+| Small (English-only)             | [small.en](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-small.en)                 |                                                                                  |
+| Tiny (Multilingual)              | [tiny](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-tiny)                         |                                                                                  |
+| Tiny (English-only)              | [tiny.en](https://huggingface.co/argmaxinc/whisperkit-coreml/tree/main/openai_whisper-tiny.en)                   | Smallest size, lowest accuracy. Only recommended for development & debugging.     |
+
 
 
 WhisperKit automatically downloads the recommended model for the device if not specified. You can also select a specific model by passing in the model name:
@@ -647,7 +686,7 @@ swift run argmax-cli diarize --help
 
 Our goal is to make this SDK better and better over time and we'd love your help! Just search the code for "TODO" for a variety of features that are yet to be built. Please refer to our [contribution guidelines](CONTRIBUTING.md) for submitting issues, pull requests, and coding standards, where we also have a public roadmap of features we are looking forward to building in the future.
 
-**External dependencies:** `Sources/ArgmaxCore/External/` contains a copy of [swift-transformers](https://github.com/huggingface/swift-transformers) (Hub and Tokenizers modules, v1.1.6) with Jinja-dependent code removed. When updating to a newer version, copy the fresh sources over that directory and re-apply the patches marked with `// Argmax-modification:` (`grep -r "Argmax-modification:" Sources/ArgmaxCore/External/`).
+**External dependencies:** `Sources/ArgmaxCore/External/` contains a copy of [swift-transformers](https://github.com/huggingface/swift-transformers) (Hub and Tokenizers modules, v1.1.6) with Jinja-dependent code removed. When updating to a newer version, copy the fresh sources over that directory and re-apply the patches marked with `// Argmax-modification:` (`grep -r "Argmax-modification:" Sources/ArgmaxCore/External/`). The matching upstream tests are vendored under `Tests/ArgmaxCoreTests/External/` using the same convention.
 
 ## License
 
@@ -659,11 +698,11 @@ This project incorporates third-party software under their own license terms. Se
 
 If you use this SDK for something cool or just find it useful, please drop us a note at [info@argmaxinc.com](mailto:info@argmaxinc.com)!
 
-If you use WhisperKit for academic work, here is the BibTeX:
+If you use WhisperKit, SpeakerKit or TTSKit for academic work, please cite the project using the following BibTeX:
 
 ```bibtex
 @misc{whisperkit-argmax,
-   title = {Argmax OSS: WhisperKit, SpeakerKit and TTSKit},
+   title = {Argmax OSS: On-device Speech AI with WhisperKit, SpeakerKit and TTSKit},
    author = {Argmax, Inc.},
    year = {2024},
    URL = {https://github.com/argmaxinc/argmax-oss-swift}

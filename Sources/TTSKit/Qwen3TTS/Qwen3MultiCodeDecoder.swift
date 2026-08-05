@@ -34,7 +34,7 @@ struct MLTensorStepResult {
 /// Per-call state is created locally within `generateMultiCodes()` and never stored
 /// on this shared instance.
 public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
-    public var model: MLModel?
+    @Protected public var model: MLModel?
 
     /// KV cache embedding dimension, detected from model at load time
     public private(set) var kvCacheEmbedDim: Int = Qwen3TTSConstants.mcdCacheDim
@@ -43,22 +43,44 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
     /// Codec vocabulary size per head (codes 1-15), detected from model output
     public private(set) var codecVocabSize: Int = Qwen3TTSConstants.codecVocabSize
 
+    /// Which function of the multifunction asset to load. Set before `loadModel`;
+    /// legacy single-function assets cannot be loaded (function selection fails).
+    public var mode: Qwen3MultiCodeDecoderMode = .stepped
+
     public init() {}
 
     public func loadModel(at url: URL, computeUnits: MLComputeUnits, prewarmMode: Bool = false) async throws {
         let modelConfig = MLModelConfiguration()
         modelConfig.computeUnits = computeUnits
-        let loaded = try await MLModel.load(contentsOf: url, configuration: modelConfig)
+        // The MultiCodeDecoder ships as a multifunction asset carrying both the
+        // `stepped` and `fused` graphs; `mode.functionName` selects one. Function
+        // selection is iOS 18+ / macOS 15+, and the asset requires the same minimum,
+        // so callers on older OS cannot load it.
+        guard #available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *) else {
+            throw TTSError.modelLoadingFailed(
+                "MultiCodeDecoder requires macOS 15 / iOS 18 (multifunction CoreML model)"
+            )
+        }
+        modelConfig.functionName = mode.functionName
+        let loaded: MLModel
+        do {
+            loaded = try await MLModel.load(contentsOf: url, configuration: modelConfig)
+        } catch {
+            throw TTSError.modelLoadingFailed(
+                "MultiCodeDecoder: failed to load function '\(mode.functionName)' from " +
+                "\(url.lastPathComponent). This must be a multifunction CoreML asset " +
+                "with 'stepped' and 'fused' functions, running on macOS 15 / iOS 18 " +
+                "or newer. (\(error.localizedDescription))"
+            )
+        }
 
         // In prewarm mode, compilation is complete - discard to free memory before next model compiles
         guard !prewarmMode else { return }
 
         self.model = loaded
-
-        // Fused variant: the entire 15-code frame is ONE CoreML program with
-        // in-graph Gumbel-max top-k sampling and embedding lookups -
-        // identified by its `gumbel` noise input (stepped models have none).
-        self.isFused = loaded.modelDescription.inputDescriptionsByName["gumbel"] != nil
+        // The selected function determines the graph: `fused` samples the whole
+        // frame in-graph, `stepped` decodes one position per prediction.
+        self.isFused = mode == .fused
 
         // Detect dimensions from model description
         if let dim = ModelUtilities.getModelOutputDimension(model, named: "key_cache_updates", position: 1) {
@@ -84,46 +106,43 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
     public private(set) var isFused = false
 
     /// One CoreML call for the whole 15-code frame. Sampling runs in-graph via
-    /// the Gumbel-max trick: `argmax(logits/T + G)` with `G = -log(-log(U))`
-    /// draws from `softmax(logits/T)` - the same distribution as the stepped
-    /// host sampler (top-k is baked into the graph). The host supplies the
-    /// noise, so the call is deterministic given it. `embed_sum` is the sum of
-    /// the sampled codes' MultiCodeEmbedder rows - the caller adds
-    /// CodeEmbedder(code0) and the text embed to form the next talker input.
-    ///
-    /// Greedy residual sampling (`multiCodeTopK == 1` or `multiCodeTemperature
-    /// == 0`) is expressed by zeroing the noise: `argmax(logits/T + 0)` is a
-    /// deterministic top-1, matching the stepped path's greedy heads. Without
-    /// this, the always-present Gumbel noise makes near-tied heads occasionally
-    /// pick a lower-probability code - an audible click on a random frame.
-    ///
-    /// Note: noise comes from the system RNG, so `GenerationOptions.seed` does
-    /// not reproduce stochastic fused-path audio (the stepped path keeps that
-    /// property; greedy is deterministic either way).
+    /// the Gumbel-max trick (`argmax(logits/T + G)` draws from `softmax(logits/T)`)
+    /// with noise from `sampler`'s RNG, so seeded generation reproduces.
+    /// `embed_sum` is the sum of the sampled codes' MultiCodeEmbedder rows.
     @available(macOS 15.0, iOS 18.0, watchOS 11.0, visionOS 2.0, *)
     public func generateMultiCodesFused(
         hiddenStatesTensor: MLTensor,
         code0EmbedTensor: MLTensor,
+        sampler: any TokenSampling,
         options: GenerationOptions
     ) async throws -> (codes: [Int32], embedSum: MLTensor, predictionTime: TimeInterval) {
         guard let model else { throw TTSError.generationFailed("MultiCodeDecoder model not loaded") }
-        // The graph divides logits by temperature; keep it strictly positive.
-        let temperature = max(options.multiCodeTemperature ?? options.temperature, 0.05)
-        let greedy = (options.multiCodeTopK ?? options.topK) <= 1
-            || (options.multiCodeTemperature ?? options.temperature) <= 0
-        var noise = [FloatType](repeating: 0, count: Qwen3TTSConstants.mcdHeads * codecVocabSize)
-        if !greedy {
-            for index in noise.indices {
-                let uniform = Float.random(in: Float.leastNormalMagnitude..<1)
-                noise[index] = FloatType(-log(-log(uniform)))
-            }
+        let noiseCount = Qwen3TTSConstants.mcdHeads * codecVocabSize
+        let temperature: Float
+        let noise: [FloatType]
+        if options.temperature <= 0 {
+            // Exact greedy: argmax(logits / 1 + 0) == argmax(logits)
+            temperature = 1
+            noise = [FloatType](repeating: 0, count: noiseCount)
+        } else {
+            // The graph divides fp16 logits by an fp16 temperature, so the floor is an fp16
+            // range guard: small values overflow and anything under
+            // 0.05 is a safe value that is practically greedy.
+            temperature = max(options.temperature, 0.05)
+            // Bare `FloatType.init` is ambiguous on x86_64 where `FloatType == Float`.
+            noise = sampler.gumbelNoise(count: noiseCount).map { FloatType($0) }
         }
-        let inputs: [String: MLTensor] = [
-            "talker_hidden": hiddenStatesTensor,
+        var inputs: [String: MLTensor] = [
+            "code0_hidden_states": hiddenStatesTensor,
             "code0_embed": code0EmbedTensor,
             "gumbel": MLTensor(shape: [Qwen3TTSConstants.mcdHeads, codecVocabSize], scalars: noise),
             "temperature": MLTensor(shape: [1], scalars: [FloatType(temperature)]),
         ]
+        if model.modelDescription.inputDescriptionsByName["top_k"] != nil {
+            // topK <= 0 means "no top-k"; the graph saturates at its compiled candidate count.
+            let topK = options.topK > 0 ? options.topK : codecVocabSize
+            inputs["top_k"] = MLTensor(shape: [1], scalars: [Int32(topK)])
+        }
         let predictionStart = CFAbsoluteTimeGetCurrent()
         let outputs = try await model.prediction(from: inputs)
         guard let codesTensor = outputs["codes"], let embedSum = outputs["embed_sum"] else {
@@ -165,16 +184,19 @@ public class Qwen3MultiCodeDecoder: MultiCodeDecoding, @unchecked Sendable {
     public func prewarmInference() async throws {
         guard let model else { return }
         if isFused {
-            // The fused model has different inputs (no external caches/masks);
-            // a few dummy full-frame calls pipeline the ANE the same way.
+            // Full-frame dummy calls pipeline the ANE the same way as the stepped loop.
             let dummyHidden = MLTensor(zeros: [1, inputEmbedDim, 1, 1], scalarType: FloatType.self)
             let dummyGumbel = MLTensor(zeros: [Qwen3TTSConstants.mcdHeads, codecVocabSize], scalarType: FloatType.self)
             let dummyTemp = MLTensor(shape: [1], scalars: [FloatType(1)])
+            var dummyInputs: [String: MLTensor] = [
+                "code0_hidden_states": dummyHidden, "code0_embed": dummyHidden,
+                "gumbel": dummyGumbel, "temperature": dummyTemp,
+            ]
+            if model.modelDescription.inputDescriptionsByName["top_k"] != nil {
+                dummyInputs["top_k"] = MLTensor(shape: [1], scalars: [Int32(1)])
+            }
             for _ in 0..<4 {
-                _ = try await model.prediction(from: [
-                    "talker_hidden": dummyHidden, "code0_embed": dummyHidden,
-                    "gumbel": dummyGumbel, "temperature": dummyTemp,
-                ])
+                _ = try await model.prediction(from: dummyInputs)
             }
             return
         }
